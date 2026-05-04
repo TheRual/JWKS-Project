@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.coverage
+.pytest_cache/
+
+# Databases
+# We usually ignore .db files, but your project requires it for persistence, 
+# so I'll leave it commented out if you want to include it.
+# totally_not_my_privateKeys.db

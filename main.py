@@ -1,4 +1,4 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from urllib.parse import urlparse, parse_qs
@@ -8,26 +8,86 @@ import jwt
 import datetime
 import sqlite3
 
+import os
+import uuid
+import time
+from argon2 import PasswordHasher
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+
 # Server configuration
 hostName = "localhost"
 serverPort = 8080
 DB_FILE = "totally_not_my_privateKeys.db"
 
+# AES encryption key from environment variable
+AES_KEY = os.environ.get("NOT_MY_KEY")
+
+def get_aes_key():
+    """Ensure the AES key is 32 bytes for AES-256."""
+    if not AES_KEY:
+        return b"default_32_byte_key_for_testing__"[:32]
+    # Pad or truncate to 32 bytes if necessary, or just use as is if we assume it's correct
+    key_bytes = AES_KEY.encode()
+    if len(key_bytes) < 32:
+        return key_bytes.ljust(32, b'\0')
+    return key_bytes[:32]
+
+def encrypt_key(data):
+    """Encrypt data using AES-CBC with a random IV."""
+    iv = os.urandom(16)
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(data) + padder.finalize()
+    
+    cipher = Cipher(algorithms.AES(get_aes_key()), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+    return encrypted_data, iv
+
+def decrypt_key(encrypted_data, iv):
+    """Decrypt data using AES-CBC with the provided IV."""
+    cipher = Cipher(algorithms.AES(get_aes_key()), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded_data = decryptor.update(encrypted_data) + decryptor.finalize()
+    
+    unpadder = padding.PKCS7(128).unpadder()
+    data = unpadder.update(padded_data) + unpadder.finalize()
+    return data
+
 def init_db():
     """
-    Initialize the SQLite database and create the 'keys' table if it doesn't exist.
-    The table stores:
-    - kid: Primary Key, Auto-incremented ID for each key.
-    - key: BLOB, the serialized RSA private key in PEM format.
-    - exp: INTEGER, the expiration timestamp (Unix time).
+    Initialize the SQLite database and create necessary tables.
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Keys table with IV column for AES
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS keys(
             kid INTEGER PRIMARY KEY AUTOINCREMENT,
             key BLOB NOT NULL,
+            iv BLOB NOT NULL,
             exp INTEGER NOT NULL
+        )
+    ''')
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            email TEXT UNIQUE,
+            date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP      
+        )
+    ''')
+    # Auth logs table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS auth_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_ip TEXT NOT NULL,
+            request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_id INTEGER,  
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
     conn.commit()
@@ -35,8 +95,7 @@ def init_db():
 
 def save_key_to_db(private_key, exp_timestamp):
     """
-    Serialize an RSA private key into PKCS1 PEM format and save it to the database.
-    This fulfills the requirement of persisting keys to disk.
+    Serialize an RSA private key, encrypt it, and save it to the database.
     """
     pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -44,42 +103,75 @@ def save_key_to_db(private_key, exp_timestamp):
         encryption_algorithm=serialization.NoEncryption()
     )
     
+    encrypted_pem, iv = encrypt_key(pem)
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO keys (key, exp) VALUES (?, ?)', (pem, exp_timestamp))
+    cursor.execute('INSERT INTO keys (key, iv, exp) VALUES (?, ?, ?)', (encrypted_pem, iv, exp_timestamp))
     conn.commit()
     conn.close()
 
 def get_key_from_db(expired=False):
     """
-    Retrieve a single private key from the database based on its expiration status.
-    Uses parameterized SQL to prevent injection attacks.
+    Retrieve and decrypt a single private key from the database.
     """
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
     if expired:
-        cursor.execute('SELECT key, kid FROM keys WHERE exp <= ? LIMIT 1', (now,))
+        cursor.execute('SELECT key, iv, kid FROM keys WHERE exp <= ? LIMIT 1', (now,))
     else:
-        cursor.execute('SELECT key, kid FROM keys WHERE exp > ? LIMIT 1', (now,))
+        cursor.execute('SELECT key, iv, kid FROM keys WHERE exp > ? LIMIT 1', (now,))
         
     row = cursor.fetchone()
     conn.close()
-    return row
+    
+    if row:
+        encrypted_pem, iv, kid = row
+        pem = decrypt_key(encrypted_pem, iv)
+        return pem, kid
+    return None
 
 def get_all_valid_keys_from_db():
     """
-    Retrieve all keys that have not yet expired from the database.
-    Used for the JWKS endpoint.
+    Retrieve and decrypt all valid keys from the database.
     """
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT key, kid FROM keys WHERE exp > ?', (now,))
+    cursor.execute('SELECT key, iv, kid FROM keys WHERE exp > ?', (now,))
     rows = cursor.fetchall()
     conn.close()
-    return rows
+    
+    decrypted_keys = []
+    for encrypted_pem, iv, kid in rows:
+        pem = decrypt_key(encrypted_pem, iv)
+        decrypted_keys.append((pem, kid))
+    return decrypted_keys
+
+class RateLimiter:
+    """Simple rate limiter implementing a fixed-window approach."""
+    def __init__(self, limit, window):
+        self.limit = limit
+        self.window = window
+        self.requests = {} # IP -> [(timestamp, count)]
+
+    def is_allowed(self, ip):
+        now = time.time()
+        if ip not in self.requests:
+            self.requests[ip] = []
+        
+        # Filter requests within the current window
+        self.requests[ip] = [t for t in self.requests[ip] if now - t < self.window]
+        
+        if len(self.requests[ip]) < self.limit:
+            self.requests[ip].append(now)
+            return True
+        return False
+
+rate_limiter = RateLimiter(10, 1) # 10 requests per second
+ph = PasswordHasher()
 
 def int_to_base64(value):
     """
@@ -104,11 +196,59 @@ class MyServer(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """
-        Handles POST requests for /auth. Implements mock authentication 
-        by extracting the username from Basic Auth or JSON payload.
+        Handles POST requests for /auth and /register.
         """
         parsed_path = urlparse(self.path)
+        
+        if parsed_path.path == "/register":
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                try:
+                    body = self.rfile.read(content_length).decode('utf-8')
+                    json_data = json.loads(body)
+                    username = json_data.get('username')
+                    email = json_data.get('email')
+                    
+                    if not username:
+                        self.send_response(400)
+                        self.end_headers()
+                        return
+
+                    # Generate UUIDv4 password
+                    password = str(uuid.uuid4())
+                    password_hash = ph.hash(password)
+                    
+                    conn = sqlite3.connect(DB_FILE)
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute('INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)', 
+                                       (username, password_hash, email))
+                        conn.commit()
+                        self.send_response(201)
+                        self.send_header("Content-type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(bytes(json.dumps({"password": password}), "utf-8"))
+                    except sqlite3.IntegrityError:
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"User already exists")
+                    finally:
+                        conn.close()
+                    return
+                except Exception as e:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
         if parsed_path.path == "/auth":
+            # Rate Limiting
+            client_ip = self.client_address[0]
+            if not rate_limiter.is_allowed(client_ip):
+                self.send_response(429)
+                self.end_headers()
+                self.wfile.write(b"Too Many Requests")
+                return
+
             username = "sampleUser" # Default username
             
             # 1. Attempt to extract username from Basic Auth header
@@ -131,6 +271,19 @@ class MyServer(BaseHTTPRequestHandler):
                         username = json_data['username']
                 except Exception:
                     pass
+
+            # Log Authentication Request
+            user_id = None
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
+            row = cursor.fetchone()
+            if row:
+                user_id = row[0]
+            
+            cursor.execute('INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)', (client_ip, user_id))
+            conn.commit()
+            conn.close()
 
             # Handle the 'expired' query parameter
             params = parse_qs(parsed_path.query)
@@ -211,7 +364,7 @@ if __name__ == "__main__":
     expired_exp = int((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).timestamp())
     save_key_to_db(expired_key, expired_exp)
 
-    webServer = HTTPServer((hostName, serverPort), MyServer)
+    webServer = ThreadingHTTPServer((hostName, serverPort), MyServer)
     print(f"Server started http://{hostName}:{serverPort}")
 
     try:
